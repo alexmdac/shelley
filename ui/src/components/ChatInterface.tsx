@@ -36,6 +36,7 @@ import SubagentTool from "./SubagentTool";
 import LLMOneShotTool from "./LLMOneShotTool";
 import OutputIframeTool from "./OutputIframeTool";
 import DirectoryPickerModal from "./DirectoryPickerModal";
+import EditorModal from "./EditorModal";
 import { useVersionChecker } from "./VersionChecker";
 import TerminalPanel, { EphemeralTerminal } from "./TerminalPanel";
 import ModelPicker from "./ModelPicker";
@@ -612,6 +613,7 @@ function ChatInterface({
   const [showDirectoryPicker, setShowDirectoryPicker] = useState(false);
   // Settings modal removed - configuration moved to status bar for empty conversations
   const [showOverflowMenu, setShowOverflowMenu] = useState(false);
+  const [showEditorModal, setShowEditorModal] = useState(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>(getStoredTheme);
   const { markdownMode, setMarkdownMode } = useMarkdown();
   const [browserNotifsEnabled, setBrowserNotifsEnabled] = useState(() =>
@@ -1756,6 +1758,29 @@ function ChatInterface({
                     Terminal
                   </button>
                 )}
+                {/* Only show when running on a remote VM; locally you'd just open the folder directly */}
+                {hostname !== "localhost" && (
+                  <button
+                    onClick={() => {
+                      setShowOverflowMenu(false);
+                      setShowEditorModal(true);
+                    }}
+                    className="overflow-menu-item show-on-desktop-only"
+                  >
+                    {/* icon from exe.dev dashboard HTML (viewBox shifted to center the shape) */}
+                    <svg
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="2 0 24 24"
+                      strokeWidth={2}
+                      style={{ width: "1.25rem", height: "1.25rem", marginRight: "0.75rem" }}
+                    >
+                      <path d="M16 2l6 4v12l-6 4-10-7.5V9.5z" />
+                      <path d="M6 9.5L16 2v20L6 14.5" />
+                    </svg>
+                    Editor
+                  </button>
+                )}
                 {links.map((link, index) => (
                   <button
                     key={index}
@@ -2209,6 +2234,14 @@ function ChatInterface({
 
       {/* Version Checker Modal */}
       {VersionModal}
+
+      {/* Editor Modal */}
+      <EditorModal
+        isOpen={showEditorModal}
+        onClose={() => setShowEditorModal(false)}
+        hostname={hostname}
+        cwd={currentConversation?.cwd || selectedCwd || "/home/exedev"}
+      />
     </div>
   );
 }
