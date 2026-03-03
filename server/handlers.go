@@ -41,9 +41,8 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Clean and enforce prefix restriction
-	clean := p
-	// Do not resolve symlinks here; enforce string prefix restriction only
-	if !(strings.HasPrefix(clean, browse.ScreenshotDir+"/")) {
+	clean := filepath.Clean(p)
+	if !(strings.HasPrefix(clean, browse.ScreenshotDir+"/") || strings.HasPrefix(clean, browse.ConsoleLogsDir+"/")) {
 		http.Error(w, "path not allowed", http.StatusForbidden)
 		return
 	}
@@ -66,6 +65,8 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/webp")
 	case ".svg":
 		w.Header().Set("Content-Type", "image/svg+xml")
+	case ".json":
+		w.Header().Set("Content-Type", "application/json")
 	default:
 		buf := make([]byte, 512)
 		n, _ := f.Read(buf)
@@ -492,14 +493,23 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request) {
 	// Get working states for all active conversations
 	workingStates := s.getWorkingConversations()
 
+	// Get subagent counts
+	subagentCounts, err := s.db.GetSubagentCounts(ctx)
+	if err != nil {
+		s.logger.Error("Failed to get subagent counts", "error", err)
+		// Non-fatal, continue with zero counts
+		subagentCounts = make(map[string]int64)
+	}
+
 	// Build response with working state included
 	// Cache git info by cwd to avoid redundant git subprocess calls
 	gitStates := make(map[string]*gitstate.GitState)
 	result := make([]ConversationWithState, len(conversations))
 	for i, conv := range conversations {
 		cws := ConversationWithState{
-			Conversation: conv,
-			Working:      workingStates[conv.ConversationID],
+			Conversation:  conv,
+			Working:       workingStates[conv.ConversationID],
+			SubagentCount: subagentCounts[conv.ConversationID],
 		}
 		if conv.Cwd != nil {
 			gs, ok := gitStates[*conv.Cwd]

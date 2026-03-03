@@ -572,6 +572,68 @@ type streamDelta struct {
 	StopSequence *string `json:"stop_sequence,omitempty"`
 }
 
+// sanitizeJSONControlChars escapes raw control characters (U+0000–U+001F)
+// that appear inside JSON string values. Per RFC 8259, these must be escaped,
+// but some upstream APIs (e.g. Anthropic) occasionally send them raw in SSE
+// event data. Go's json.Unmarshal correctly rejects them, so we fix them up
+// before parsing.
+//
+// TODO: this is a workaround for Anthropic sending invalid JSON in their
+// streaming API. Remove once they fix their encoder.
+func sanitizeJSONControlChars(data []byte) []byte {
+	// Quick check: if no raw control chars exist, return as-is.
+	// We skip \n and \r because they can't appear inside SSE data lines
+	// (they're line terminators), so they're always structural.
+	hasControl := false
+	for _, b := range data {
+		if b < 0x20 && b != '\n' && b != '\r' {
+			hasControl = true
+			break
+		}
+	}
+	if !hasControl {
+		return data
+	}
+
+	// Walk the bytes, tracking whether we're inside a JSON string.
+	// When we encounter a raw control char inside a string, replace it
+	// with its \uXXXX escape.
+	var buf bytes.Buffer
+	buf.Grow(len(data) + 64)
+	inString := false
+	for i := 0; i < len(data); i++ {
+		b := data[i]
+		if inString {
+			if b == '\\' {
+				// Escaped character — write both bytes and skip next
+				buf.WriteByte(b)
+				if i+1 < len(data) {
+					i++
+					buf.WriteByte(data[i])
+				}
+				continue
+			}
+			if b == '"' {
+				inString = false
+				buf.WriteByte(b)
+				continue
+			}
+			if b < 0x20 {
+				// Raw control char inside a string — escape it
+				fmt.Fprintf(&buf, "\\u%04x", b)
+				continue
+			}
+			buf.WriteByte(b)
+		} else {
+			if b == '"' {
+				inString = true
+			}
+			buf.WriteByte(b)
+		}
+	}
+	return buf.Bytes()
+}
+
 // parseSSEStream reads an SSE stream and assembles the complete response.
 func parseSSEStream(r io.Reader) (*response, error) {
 	var (
@@ -596,7 +658,7 @@ func parseSSEStream(r io.Reader) (*response, error) {
 		}
 
 		var event streamEvent
-		if err := json.Unmarshal([]byte(data), &event); err != nil {
+		if err := json.Unmarshal(sanitizeJSONControlChars([]byte(data)), &event); err != nil {
 			return nil, fmt.Errorf("parsing SSE event: %w", err)
 		}
 
@@ -732,9 +794,18 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 			return nil, fmt.Errorf("anthropic request failed after %d attempts: %w", attempts, errs)
 		}
 		if attempts > 0 {
+			// Bail out early if context is already done — no point sleeping
+			// and retrying when every attempt will fail immediately.
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("anthropic request failed after %d attempts (context cancelled): %w", attempts, errs)
+			}
 			sleep := backoff[min(attempts-1, len(backoff)-1)] + time.Duration(rand.Int64N(int64(time.Second)))
 			slog.WarnContext(ctx, "anthropic request sleep before retry", "sleep", sleep, "attempts", attempts)
-			time.Sleep(sleep)
+			select {
+			case <-time.After(sleep):
+			case <-ctx.Done():
+				return nil, fmt.Errorf("anthropic request failed after %d attempts (context cancelled during backoff): %w", attempts, errs)
+			}
 		}
 		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(payload))
 		if err != nil {

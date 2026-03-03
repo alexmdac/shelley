@@ -35,6 +35,10 @@ import ChangeDirTool from "./ChangeDirTool";
 import SubagentTool from "./SubagentTool";
 import LLMOneShotTool from "./LLMOneShotTool";
 import OutputIframeTool from "./OutputIframeTool";
+import BrowserEmulateTool from "./BrowserEmulateTool";
+import BrowserNetworkTool from "./BrowserNetworkTool";
+import BrowserAccessibilityTool from "./BrowserAccessibilityTool";
+import BrowserProfileTool from "./BrowserProfileTool";
 import DirectoryPickerModal from "./DirectoryPickerModal";
 import EditorModal from "./EditorModal";
 import { useVersionChecker } from "./VersionChecker";
@@ -48,6 +52,7 @@ interface ContextUsageBarProps {
   conversationId?: string | null;
   modelName?: string;
   onDistillConversation?: () => void;
+  agentWorking?: boolean;
 }
 
 function ContextUsageBar({
@@ -56,6 +61,7 @@ function ContextUsageBar({
   conversationId,
   modelName,
   onDistillConversation,
+  agentWorking,
 }: ContextUsageBarProps) {
   const [showPopup, setShowPopup] = useState(false);
   const [distilling, setDistilling] = useState(false);
@@ -82,17 +88,20 @@ function ContextUsageBar({
     setShowPopup(!showPopup);
   };
 
-  // Auto-open popup when hitting 100k tokens (once per conversation)
+  // Auto-open popup when hitting 100k tokens (once per conversation).
+  // Only auto-open at end of turn (when agent is not working) so we don't
+  // interrupt the user while the agent is plugging away.
   useEffect(() => {
     if (
       showLongConversationWarning &&
+      !agentWorking &&
       conversationId &&
       hasAutoOpenedRef.current !== conversationId
     ) {
       hasAutoOpenedRef.current = conversationId;
       setShowPopup(true);
     }
-  }, [showLongConversationWarning, conversationId]);
+  }, [showLongConversationWarning, agentWorking, conversationId]);
 
   // Close popup when clicking outside
   useEffect(() => {
@@ -216,6 +225,20 @@ function ContextUsageBar({
   );
 }
 
+interface CoalescedItem {
+  type: "message" | "tool";
+  message?: Message;
+  toolUseId?: string;
+  toolName?: string;
+  toolInput?: unknown;
+  toolResult?: LLMContent[];
+  toolError?: boolean;
+  toolStartTime?: string | null;
+  toolEndTime?: string | null;
+  hasResult?: boolean;
+  display?: unknown;
+}
+
 interface CoalescedToolCallProps {
   toolName: string;
   toolInput?: unknown;
@@ -243,6 +266,10 @@ const TOOL_COMPONENTS: Record<string, React.ComponentType<any>> = {
   subagent: SubagentTool,
   output_iframe: OutputIframeTool,
   llm_one_shot: LLMOneShotTool,
+  browser_emulate: BrowserEmulateTool,
+  browser_network: BrowserNetworkTool,
+  browser_accessibility: BrowserAccessibilityTool,
+  browser_profile: BrowserProfileTool,
   // Backwards compat: old per-action tool names stored in existing databases.
   browser_take_screenshot: ScreenshotTool,
   browser_navigate: BrowserNavigateTool,
@@ -252,7 +279,7 @@ const TOOL_COMPONENTS: Record<string, React.ComponentType<any>> = {
   browser_clear_console_logs: BrowserConsoleLogsTool,
 };
 
-function CoalescedToolCall({
+const CoalescedToolCall = React.memo(function CoalescedToolCall({
   toolName,
   toolInput,
   toolResult,
@@ -421,7 +448,7 @@ function CoalescedToolCall({
       </div>
     </div>
   );
-}
+});
 
 // Animated "Agent working..." with letter-by-letter bold animation
 function AnimatedWorkingStatus() {
@@ -616,6 +643,14 @@ function ChatInterface({
   const [showEditorModal, setShowEditorModal] = useState(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>(getStoredTheme);
   const { markdownMode, setMarkdownMode } = useMarkdown();
+  const [isMobile, setIsMobile] = useState(() => window.innerWidth < 768);
+
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 767px)");
+    const onChange = (e: MediaQueryListEvent) => setIsMobile(e.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
   const [browserNotifsEnabled, setBrowserNotifsEnabled] = useState(() =>
     isChannelEnabled("browser"),
   );
@@ -651,6 +686,12 @@ function ChatInterface({
   const loadingRef = useRef(false);
   // Pending scroll target from loadMessages: undefined = none, null = bottom, number = saved position
   const pendingScrollRef = useRef<number | null | undefined>(undefined);
+
+  const handleOpenDiffViewer = useCallback((commit: string, cwd?: string) => {
+    setDiffViewerInitialCommit(commit);
+    setDiffViewerCwd(cwd);
+    setShowDiffViewer(true);
+  }, []);
 
   // Navigate to next/previous user message when trigger changes
   useEffect(() => {
@@ -1339,27 +1380,13 @@ function ChatInterface({
     return title;
   };
 
-  // Process messages to coalesce tool calls
-  const processMessages = () => {
+  // Process messages to coalesce tool calls (memoized to avoid re-parsing on every render)
+  const coalescedItems = useMemo(() => {
     if (messages.length === 0) {
-      return [];
+      return [] as CoalescedItem[];
     }
 
-    interface CoalescedItem {
-      type: "message" | "tool";
-      message?: Message;
-      toolUseId?: string;
-      toolName?: string;
-      toolInput?: unknown;
-      toolResult?: LLMContent[];
-      toolError?: boolean;
-      toolStartTime?: string | null;
-      toolEndTime?: string | null;
-      hasResult?: boolean;
-      display?: unknown;
-    }
-
-    const coalescedItems: CoalescedItem[] = [];
+    const items: CoalescedItem[] = [];
     const toolResultMap: Record<
       string,
       {
@@ -1369,13 +1396,10 @@ function ChatInterface({
         endTime: string | null;
       }
     > = {};
-    // Some tool results may be delivered only as display_data (e.g., screenshots)
-    const displayResultSet: Set<string> = new Set();
     const displayDataMap: Record<string, unknown> = {};
 
-    // First pass: collect all tool results
+    // First pass: collect all tool results and their display data from llm_data
     messages.forEach((message) => {
-      // Collect tool_result data from llm_data if present
       if (message.llm_data) {
         try {
           const llmData =
@@ -1390,39 +1414,14 @@ function ChatInterface({
                   startTime: content.ToolUseStartTime || null,
                   endTime: content.ToolUseEndTime || null,
                 };
+                if (content.Display) {
+                  displayDataMap[content.ToolUseID] = content.Display;
+                }
               }
             });
           }
         } catch (err) {
           console.error("Failed to parse message LLM data for tool results:", err);
-        }
-      }
-
-      // Also collect tool_use_ids from display_data to mark completion even if llm_data is omitted
-      if (message.display_data) {
-        try {
-          const displays =
-            typeof message.display_data === "string"
-              ? JSON.parse(message.display_data)
-              : message.display_data;
-          if (Array.isArray(displays)) {
-            for (const d of displays) {
-              if (
-                d &&
-                typeof d === "object" &&
-                "tool_use_id" in d &&
-                typeof d.tool_use_id === "string"
-              ) {
-                displayResultSet.add(d.tool_use_id);
-                // Store the display data for this tool use
-                if ("display" in d) {
-                  displayDataMap[d.tool_use_id] = d.display;
-                }
-              }
-            }
-          }
-        } catch (err) {
-          console.error("Failed to parse display_data for tool completion:", err);
         }
       }
     });
@@ -1434,12 +1433,12 @@ function ChatInterface({
         if (!isDistillStatusMessage(message)) {
           return;
         }
-        coalescedItems.push({ type: "message", message });
+        items.push({ type: "message", message });
         return;
       }
 
       if (message.type === "error") {
-        coalescedItems.push({ type: "message", message });
+        items.push({ type: "message", message });
         return;
       }
 
@@ -1459,7 +1458,7 @@ function ChatInterface({
 
       // If it's a user message without tool results, show it
       if (message.type === "user" && !hasToolResult) {
-        coalescedItems.push({ type: "message", message });
+        items.push({ type: "message", message });
         return;
       }
 
@@ -1493,7 +1492,7 @@ function ChatInterface({
               .join("")
               .trim();
             if (textString) {
-              coalescedItems.push({ type: "message", message });
+              items.push({ type: "message", message });
             }
 
             // Check if this message was truncated (tool calls lost)
@@ -1502,9 +1501,8 @@ function ChatInterface({
             // Add tool uses as separate items
             toolUses.forEach((toolUse) => {
               const resultData = toolUse.ID ? toolResultMap[toolUse.ID] : undefined;
-              const completedViaDisplay = toolUse.ID ? displayResultSet.has(toolUse.ID) : false;
               const displayData = toolUse.ID ? displayDataMap[toolUse.ID] : undefined;
-              coalescedItems.push({
+              items.push({
                 type: "tool",
                 toolUseId: toolUse.ID,
                 toolName: toolUse.ToolName,
@@ -1515,22 +1513,22 @@ function ChatInterface({
                 toolStartTime: resultData?.startTime,
                 toolEndTime: resultData?.endTime,
                 // Mark as complete if truncated (tool was lost, not running)
-                hasResult: !!resultData || completedViaDisplay || wasTruncated,
+                hasResult: !!resultData || wasTruncated,
                 display: displayData,
               });
             });
           }
         } catch (err) {
           console.error("Failed to parse message LLM data:", err);
-          coalescedItems.push({ type: "message", message });
+          items.push({ type: "message", message });
         }
       } else {
-        coalescedItems.push({ type: "message", message });
+        items.push({ type: "message", message });
       }
     });
 
-    return coalescedItems;
-  };
+    return items;
+  }, [messages]);
 
   const renderMessages = () => {
     if (messages.length === 0) {
@@ -1581,19 +1579,13 @@ function ChatInterface({
       );
     }
 
-    const coalescedItems = processMessages();
-
     const rendered = coalescedItems.map((item, index) => {
       if (item.type === "message" && item.message) {
         return (
           <MessageComponent
             key={item.message.message_id}
             message={item.message}
-            onOpenDiffViewer={(commit, cwd) => {
-              setDiffViewerInitialCommit(commit);
-              setDiffViewerCwd(cwd);
-              setShowDiffViewer(true);
-            }}
+            onOpenDiffViewer={handleOpenDiffViewer}
             onCommentTextChange={setDiffCommentText}
           />
         );
@@ -1624,6 +1616,127 @@ function ChatInterface({
       ...rendered,
     ];
   };
+
+  // Status bar content — rendered in the standalone status bar (desktop) and
+  // inline in the message input controls row (mobile via CSS).
+  function renderStatusContent() {
+    return currentConversation?.archived ? (
+      // Archived state
+      <>
+        <span className="status-message">This conversation is archived.</span>
+        <button onClick={handleUnarchive} className="status-button status-button-primary">
+          Unarchive
+        </button>
+      </>
+    ) : isDisconnected ? (
+      // Disconnected state
+      <>
+        <span className="status-message status-warning">Disconnected</span>
+        <button onClick={reconnect} className="status-button status-button-primary">
+          Retry
+        </button>
+      </>
+    ) : isReconnecting ? (
+      // Reconnecting state
+      <>
+        <span className="status-message status-reconnecting">
+          Reconnecting{reconnectAttempts > 0 ? ` (${reconnectAttempts}/3)` : ""}
+          <span className="reconnecting-dots">...</span>
+        </span>
+      </>
+    ) : error ? (
+      // Error state
+      <>
+        <span className="status-message status-error">{error}</span>
+        <button onClick={() => setError(null)} className="status-button status-button-text">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M6 18L18 6M6 6l12 12"
+            />
+          </svg>
+        </button>
+      </>
+    ) : agentWorking && conversationId ? (
+      // Agent working — show status with stop button and context bar
+      <div className="status-bar-active" data-testid="agent-thinking">
+        <div className="status-working-group">
+          <AnimatedWorkingStatus />
+          <button
+            onClick={handleCancel}
+            disabled={cancelling}
+            className="status-stop-button"
+            title={cancelling ? "Cancelling..." : "Stop"}
+          >
+            <svg viewBox="0 0 24 24" fill="currentColor">
+              <rect x="6" y="6" width="12" height="12" rx="1" />
+            </svg>
+            <span className="status-stop-label">{cancelling ? "Cancelling..." : "Stop"}</span>
+          </button>
+        </div>
+        <ContextUsageBar
+          contextWindowSize={contextWindowSize}
+          maxContextTokens={
+            models.find((m) => m.id === selectedModel)?.max_context_tokens || 200000
+          }
+          conversationId={conversationId}
+          modelName={selectedModelDisplayName}
+          onDistillConversation={onDistillConversation ? handleDistillConversation : undefined}
+          agentWorking={agentWorking}
+        />
+      </div>
+    ) : !conversationId ? (
+      // New conversation — show model picker and cwd selector
+      <div className="status-bar-new-conversation">
+        <div
+          className="status-field status-field-model"
+          title="AI model to use for this conversation"
+        >
+          <span className="status-field-label">Model:</span>
+          <ModelPicker
+            models={models}
+            selectedModel={selectedModel}
+            onSelectModel={setSelectedModel}
+            onManageModels={() => onOpenModelsModal?.()}
+            disabled={sending}
+          />
+        </div>
+        <div
+          className={`status-field status-field-cwd${cwdError ? " status-field-error" : ""}`}
+          title={cwdError || "Working directory for file operations"}
+        >
+          <span className="status-field-label">Dir:</span>
+          <button
+            className={`status-chip${cwdError ? " status-chip-error" : ""}`}
+            onClick={() => setShowDirectoryPicker(true)}
+            disabled={sending}
+          >
+            {selectedCwd || "(no cwd)"}
+          </button>
+        </div>
+      </div>
+    ) : (
+      // Active conversation — show ready message and context bar
+      <div className="status-bar-active">
+        <span className="status-message status-ready">
+          <span className="hide-on-mobile">Ready on </span>
+          {hostname}
+        </span>
+        <ContextUsageBar
+          contextWindowSize={contextWindowSize}
+          maxContextTokens={
+            models.find((m) => m.id === selectedModel)?.max_context_tokens || 200000
+          }
+          conversationId={conversationId}
+          modelName={selectedModelDisplayName}
+          onDistillConversation={onDistillConversation ? handleDistillConversation : undefined}
+          agentWorking={agentWorking}
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="full-height flex flex-col">
@@ -2065,132 +2178,17 @@ function ChatInterface({
         }}
       />
 
-      {/* Unified Status Bar */}
-      <div className="status-bar">
+      {/* Status bar — always visible on desktop; hidden on mobile for active convos
+          (CSS hides it, and content is suppressed to avoid duplicate DOM elements). */}
+      <div
+        className={`status-bar${currentConversation?.archived ? " status-bar-archived" : ""}${!conversationId ? " status-bar-new" : ""}`}
+      >
         <div className="status-bar-content">
-          {currentConversation?.archived ? (
-            // Archived state
-            <>
-              <span className="status-message">This conversation is archived.</span>
-              <button onClick={handleUnarchive} className="status-button status-button-primary">
-                Unarchive
-              </button>
-            </>
-          ) : isDisconnected ? (
-            // Disconnected state
-            <>
-              <span className="status-message status-warning">Disconnected</span>
-              <button onClick={reconnect} className="status-button status-button-primary">
-                Retry
-              </button>
-            </>
-          ) : isReconnecting ? (
-            // Reconnecting state - show during backoff attempts
-            <>
-              <span className="status-message status-reconnecting">
-                Reconnecting{reconnectAttempts > 0 ? ` (${reconnectAttempts}/3)` : ""}
-                <span className="reconnecting-dots">...</span>
-              </span>
-            </>
-          ) : error ? (
-            // Error state
-            <>
-              <span className="status-message status-error">{error}</span>
-              <button onClick={() => setError(null)} className="status-button status-button-text">
-                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M6 18L18 6M6 6l12 12"
-                  />
-                </svg>
-              </button>
-            </>
-          ) : agentWorking && conversationId ? (
-            // Agent working - show status with stop button and context bar
-            <div className="status-bar-active" data-testid="agent-thinking">
-              <div className="status-working-group">
-                <AnimatedWorkingStatus />
-                <button
-                  onClick={handleCancel}
-                  disabled={cancelling}
-                  className="status-stop-button"
-                  title={cancelling ? "Cancelling..." : "Stop"}
-                >
-                  <svg viewBox="0 0 24 24" fill="currentColor">
-                    <rect x="6" y="6" width="12" height="12" rx="1" />
-                  </svg>
-                  <span className="status-stop-label">{cancelling ? "Cancelling..." : "Stop"}</span>
-                </button>
-              </div>
-              <ContextUsageBar
-                contextWindowSize={contextWindowSize}
-                maxContextTokens={
-                  models.find((m) => m.id === selectedModel)?.max_context_tokens || 200000
-                }
-                conversationId={conversationId}
-                modelName={selectedModelDisplayName}
-                onDistillConversation={
-                  onDistillConversation ? handleDistillConversation : undefined
-                }
-              />
-            </div>
-          ) : // Idle state - show ready message, or configuration for empty conversation
-          !conversationId ? (
-            // Empty conversation - show model (left) and cwd (right)
-            <div className="status-bar-new-conversation">
-              {/* Model selector - far left */}
-              <div
-                className="status-field status-field-model"
-                title="AI model to use for this conversation"
-              >
-                <span className="status-field-label">Model:</span>
-                <ModelPicker
-                  models={models}
-                  selectedModel={selectedModel}
-                  onSelectModel={setSelectedModel}
-                  onManageModels={() => onOpenModelsModal?.()}
-                  disabled={sending}
-                />
-              </div>
-
-              {/* CWD indicator - far right */}
-              <div
-                className={`status-field status-field-cwd${cwdError ? " status-field-error" : ""}`}
-                title={cwdError || "Working directory for file operations"}
-              >
-                <span className="status-field-label">Dir:</span>
-                <button
-                  className={`status-chip${cwdError ? " status-chip-error" : ""}`}
-                  onClick={() => setShowDirectoryPicker(true)}
-                  disabled={sending}
-                >
-                  {selectedCwd || "(no cwd)"}
-                </button>
-              </div>
-            </div>
-          ) : (
-            // Active conversation - show Ready + context bar
-            <div className="status-bar-active">
-              <span className="status-message status-ready">Ready on {hostname}</span>
-              <ContextUsageBar
-                contextWindowSize={contextWindowSize}
-                maxContextTokens={
-                  models.find((m) => m.id === selectedModel)?.max_context_tokens || 200000
-                }
-                conversationId={conversationId}
-                modelName={selectedModelDisplayName}
-                onDistillConversation={
-                  onDistillConversation ? handleDistillConversation : undefined
-                }
-              />
-            </div>
-          )}
+          {(!isMobile || !conversationId || currentConversation?.archived) && renderStatusContent()}
         </div>
       </div>
 
-      {/* Message input - hidden for archived conversations */}
+      {/* Message input — hidden for archived conversations */}
       {!currentConversation?.archived && (
         <MessageInput
           key={conversationId || "new"}
@@ -2204,6 +2202,7 @@ function ChatInterface({
           }}
           persistKey={conversationId || "new-conversation"}
           initialRows={conversationId ? 1 : 3}
+          statusSlot={conversationId && isMobile ? renderStatusContent() : undefined}
         />
       )}
 

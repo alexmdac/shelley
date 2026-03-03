@@ -24,6 +24,10 @@ import ChangeDirTool from "./ChangeDirTool";
 import SubagentTool from "./SubagentTool";
 import LLMOneShotTool from "./LLMOneShotTool";
 import OutputIframeTool from "./OutputIframeTool";
+import BrowserEmulateTool from "./BrowserEmulateTool";
+import BrowserNetworkTool from "./BrowserNetworkTool";
+import BrowserAccessibilityTool from "./BrowserAccessibilityTool";
+import BrowserProfileTool from "./BrowserProfileTool";
 import ThinkingContent from "./ThinkingContent";
 import UsageDetailModal from "./UsageDetailModal";
 import MessageActionBar from "./MessageActionBar";
@@ -300,7 +304,11 @@ function DistillStatusMessage({ message }: { message: MessageType }) {
   );
 }
 
-function Message({ message, onOpenDiffViewer, onCommentTextChange }: MessageProps) {
+const Message = React.memo(function Message({
+  message,
+  onOpenDiffViewer,
+  onCommentTextChange,
+}: MessageProps) {
   const { markdownMode } = useMarkdown();
 
   // Render system messages with distill_status as status indicators
@@ -591,6 +599,18 @@ function Message({ message, onOpenDiffViewer, onCommentTextChange }: MessageProp
         if (content.ToolName === "output_iframe") {
           return <OutputIframeTool toolInput={content.ToolInput} isRunning={true} />;
         }
+        if (content.ToolName === "browser_emulate") {
+          return <BrowserEmulateTool toolInput={content.ToolInput} isRunning={true} />;
+        }
+        if (content.ToolName === "browser_network") {
+          return <BrowserNetworkTool toolInput={content.ToolInput} isRunning={true} />;
+        }
+        if (content.ToolName === "browser_accessibility") {
+          return <BrowserAccessibilityTool toolInput={content.ToolInput} isRunning={true} />;
+        }
+        if (content.ToolName === "browser_profile") {
+          return <BrowserProfileTool toolInput={content.ToolInput} isRunning={true} />;
+        }
         // Backwards compat: old per-action tool names stored in existing databases.
         if (content.ToolName === "browser_take_screenshot") {
           return <ScreenshotTool toolInput={content.ToolInput} isRunning={true} />;
@@ -794,6 +814,54 @@ function Message({ message, onOpenDiffViewer, onCommentTextChange }: MessageProp
               hasError={hasError}
               executionTime={executionTime}
               display={content.Display}
+            />
+          );
+        }
+
+        if (toolName === "browser_emulate") {
+          return (
+            <BrowserEmulateTool
+              toolInput={toolInput}
+              isRunning={false}
+              toolResult={content.ToolResult}
+              hasError={hasError}
+              executionTime={executionTime}
+            />
+          );
+        }
+
+        if (toolName === "browser_network") {
+          return (
+            <BrowserNetworkTool
+              toolInput={toolInput}
+              isRunning={false}
+              toolResult={content.ToolResult}
+              hasError={hasError}
+              executionTime={executionTime}
+            />
+          );
+        }
+
+        if (toolName === "browser_accessibility") {
+          return (
+            <BrowserAccessibilityTool
+              toolInput={toolInput}
+              isRunning={false}
+              toolResult={content.ToolResult}
+              hasError={hasError}
+              executionTime={executionTime}
+            />
+          );
+        }
+
+        if (toolName === "browser_profile") {
+          return (
+            <BrowserProfileTool
+              toolInput={toolInput}
+              isRunning={false}
+              toolResult={content.ToolResult}
+              hasError={hasError}
+              executionTime={executionTime}
             />
           );
         }
@@ -1179,7 +1247,7 @@ function Message({ message, onOpenDiffViewer, onCommentTextChange }: MessageProp
       )}
     </>
   );
-}
+});
 
 // Helper functions
 function hasToolResult(llmMessage: LLMMessage | null): boolean {

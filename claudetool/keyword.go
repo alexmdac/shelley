@@ -214,7 +214,12 @@ func ripgrep(ctx context.Context, wd string, terms []string) (string, error) {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
 			return "no matches found", nil
 		}
-		return "", fmt.Errorf("search failed: %v\n%s", err, out)
+		// Truncate error output to avoid storing enormous data in the conversation.
+		errOut := string(out)
+		if len(errOut) > 50*1024 {
+			errOut = errOut[:50*1024] + "\n... [truncated]"
+		}
+		return "", fmt.Errorf("search failed: %v\n%s", err, errOut)
 	}
 	outStr := string(out)
 	return outStr, nil
@@ -222,10 +227,7 @@ func ripgrep(ctx context.Context, wd string, terms []string) (string, error) {
 
 // selectBestLLM selects the best available LLM service for keyword search
 func (k *KeywordTool) selectBestLLM(provider LLMServiceProvider) (llm.Service, error) {
-	// Preferred models in order of preference for keyword search (fast, cheap models preferred)
-	preferredModels := []string{"gpt-oss-20b-fireworks", "gpt-5-thinking-mini", "gpt5-mini", "claude-sonnet-4.6", "claude-sonnet-4.5", "predictable"}
-
-	for _, model := range preferredModels {
+	for _, model := range PreferredToolModels {
 		svc, err := provider.GetService(model)
 		if err == nil {
 			return svc, nil
